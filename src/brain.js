@@ -1,6 +1,7 @@
 // brain.js — Le "cerveau" du bot.
 // Responsabilites : charger le system prompt + la base de connaissances,
-// appeler l'API Claude, et separer la reponse client du signal de controle §CTRL§.
+// injecter la date du jour, appeler l'API Claude, et separer la reponse
+// client du signal de controle §CTRL§.
 
 import fs from 'fs';
 import path from 'path';
@@ -11,9 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const KNOWLEDGE_DIR = path.join(__dirname, '..', 'knowledge');
 
 // --- Chargement du prompt au demarrage ---
-// On lit les deux fichiers une seule fois et on injecte la base
-// a l'emplacement du marqueur {{BASE_DE_CONNAISSANCES}}.
-function buildSystemPrompt() {
+function buildSystemTemplate() {
   const systemTemplate = fs.readFileSync(
     path.join(KNOWLEDGE_DIR, 'system_prompt.md'),
     'utf-8'
@@ -30,7 +29,52 @@ function buildSystemPrompt() {
   return systemTemplate.replace('{{BASE_DE_CONNAISSANCES}}', knowledge);
 }
 
-const SYSTEM_PROMPT = buildSystemPrompt();
+const SYSTEM_TEMPLATE = buildSystemTemplate();
+
+// --- Date du jour au fuseau du Tchad (UTC+1, pas d'heure d'ete) ---
+const JOURS = [
+  'dimanche', 'lundi', 'mardi', 'mercredi',
+  'jeudi', 'vendredi', 'samedi',
+];
+const MOIS = [
+  'janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin',
+  'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre',
+];
+
+function dateTchad(offsetJours = 0) {
+  const maintenant = new Date();
+  const tchad = new Date(
+    maintenant.getTime() + (1 * 60 * 60 * 1000) + (offsetJours * 24 * 60 * 60 * 1000)
+  );
+  const jour = JOURS[tchad.getUTCDay()];
+  const num = tchad.getUTCDate();
+  const mois = MOIS[tchad.getUTCMonth()];
+  const annee = tchad.getUTCFullYear();
+  return { jour, texte: jour + ' ' + num + ' ' + mois + ' ' + annee };
+}
+
+function buildDateBlock() {
+  const aujourdhui = dateTchad(0);
+  const demain = dateTchad(1);
+  const prochains = [];
+  for (let i = 0; i < 7; i++) {
+    prochains.push('- ' + dateTchad(i).texte);
+  }
+  return [
+    "Nous sommes aujourd'hui : " + aujourdhui.texte + ' (heure du Tchad).',
+    'Demain sera : ' + demain.texte + '.',
+    'Les 7 prochains jours :',
+    prochains.join('\n'),
+  ].join('\n');
+}
+
+function buildDatedSystemPrompt() {
+  const dateBlock = buildDateBlock();
+  if (SYSTEM_TEMPLATE.includes('{{DATE_DU_JOUR}}')) {
+    return SYSTEM_TEMPLATE.replace('{{DATE_DU_JOUR}}', dateBlock);
+  }
+  return dateBlock + '\n\n' + SYSTEM_TEMPLATE;
+}
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -39,15 +83,11 @@ const anthropic = new Anthropic({
 const MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-7';
 
 // --- Parsing du signal de controle ---
-// Le bot termine chaque reponse par une ligne : §CTRL§{...json...}
-// On separe le texte (a envoyer au client) du JSON (lu par le backend).
 const CTRL_MARKER = '§CTRL§';
 
 function parseControlSignal(rawText) {
   const idx = rawText.lastIndexOf(CTRL_MARKER);
 
-  // Valeur par defaut si le signal manque ou est illisible :
-  // on n'escalade pas, mais on le note pour le monitoring.
   const fallback = {
     escalade: false,
     motif: null,
@@ -76,23 +116,21 @@ function parseControlSignal(rawText) {
 }
 
 // --- Appel principal ---
-// history : tableau [{ role, content }] des messages precedents (sans le nouveau).
-// userMessage : le nouveau message du client.
-// Retourne { reply, control, controlOk }.
 export async function generateReply(history, userMessage) {
   const messages = [
     ...history,
     { role: 'user', content: userMessage },
   ];
 
+  const systemPrompt = buildDatedSystemPrompt();
+
   const response = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 1024,
-    system: SYSTEM_PROMPT,
+    system: systemPrompt,
     messages,
   });
 
-  // On concatene les blocs texte de la reponse.
   const rawText = response.content
     .filter((block) => block.type === 'text')
     .map((block) => block.text)
