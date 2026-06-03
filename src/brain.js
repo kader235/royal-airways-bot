@@ -1,8 +1,8 @@
 // brain.js — Le "cerveau" du bot.
 // Responsabilites : charger le system prompt + la base de connaissances,
-// injecter la date du jour, appeler l'API Claude, et separer la reponse
-// client du signal de controle §CTRL§.
-
+// injecter la date du jour ET les annonces actives, appeler l'API Claude,
+// et separer la reponse client du signal de controle §CTRL§.
+import { getActiveAnnouncementsForPrompt } from './announcementsFetcher.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -68,12 +68,40 @@ function buildDateBlock() {
   ].join('\n');
 }
 
-function buildDatedSystemPrompt() {
+// --- Construction du system prompt avec date ET annonces actives ---
+// Note: cette fonction est devenue async car elle interroge l'API admin
+// pour recuperer les annonces. Le fetcher a un cache de 1 minute donc
+// l'impact perf est minimal (1 appel HTTP par minute au pire).
+async function buildDatedSystemPrompt() {
   const dateBlock = buildDateBlock();
-  if (SYSTEM_TEMPLATE.includes('{{DATE_DU_JOUR}}')) {
-    return SYSTEM_TEMPLATE.replace('{{DATE_DU_JOUR}}', dateBlock);
+
+  // Recuperer les annonces actives depuis l'admin (avec cache integre)
+  let annoncesBlock = 'Aucune annonce particuliere en ce moment.';
+  try {
+    annoncesBlock = await getActiveAnnouncementsForPrompt();
+  } catch (err) {
+    console.error('[brain] Echec recuperation annonces, on continue sans :', err.message);
   }
-  return dateBlock + '\n\n' + SYSTEM_TEMPLATE;
+
+  // Injection des deux blocs dans le template
+  let prompt = SYSTEM_TEMPLATE;
+
+  if (prompt.includes('{{DATE_DU_JOUR}}')) {
+    prompt = prompt.replace('{{DATE_DU_JOUR}}', dateBlock);
+  } else {
+    prompt = dateBlock + '\n\n' + prompt;
+  }
+
+  if (prompt.includes('{{ANNONCES_ACTIVES}}')) {
+    prompt = prompt.replace('{{ANNONCES_ACTIVES}}', annoncesBlock);
+  } else {
+    // Si le marqueur n'est pas (encore) dans system_prompt.md, on l'ajoute en tete
+    // pour que le bot tienne quand meme compte des annonces.
+    prompt = annoncesBlock + '\n\n' + prompt;
+    console.warn('[brain] Marqueur {{ANNONCES_ACTIVES}} absent du system_prompt.md, ajout en tete.');
+  }
+
+  return prompt;
 }
 
 const anthropic = new Anthropic({
@@ -122,7 +150,8 @@ export async function generateReply(history, userMessage) {
     { role: 'user', content: userMessage },
   ];
 
-  const systemPrompt = buildDatedSystemPrompt();
+  // Build du system prompt (maintenant async car il interroge l'admin)
+  const systemPrompt = await buildDatedSystemPrompt();
 
   const response = await anthropic.messages.create({
     model: MODEL,
