@@ -1,6 +1,10 @@
 // brain.js — Le "cerveau" du bot.
 // Charge le system prompt + base de connaissances, injecte date, annonces,
 // lignes, tarifs et bagages en temps reel, puis appelle l'API Claude.
+//
+// V2 : ajout du parcours de reservation guidee. Claude peut emettre un signal
+// §LINK§{...} a la fin de sa reponse, qui declenche la generation d'un deep link
+// vers booking.flyroyalairways.com avec les criteres pre-remplis.
 
 import {
   getActiveAnnouncementsForPrompt,
@@ -8,6 +12,7 @@ import {
   getFaresForPrompt,
   getKnowledgeForPrompt,
 } from './announcementsFetcher.js';
+import { buildBookingURL } from './bookingLink.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -109,7 +114,9 @@ async function buildDatedSystemPrompt() {
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-7';
 const CTRL_MARKER = '§CTRL§';
+const LINK_MARKER = '§LINK§';
 
+// Parse le signal de controle §CTRL§{json} a la fin de la reponse.
 function parseControlSignal(rawText) {
   const idx = rawText.lastIndexOf(CTRL_MARKER);
   const fallback = { escalade: false, motif: null, langue: 'fr', intention: 'autre' };
@@ -126,6 +133,79 @@ function parseControlSignal(rawText) {
   }
 }
 
+// Parse le signal de reservation §LINK§{json} dans la reponse.
+// Retire le marqueur du texte, et si valide, retourne les criteres de booking.
+function parseBookingSignal(text) {
+  const idx = text.indexOf(LINK_MARKER);
+  if (idx === -1) return { text, bookingRequest: null };
+
+  // Cherche la fin du JSON (premiere accolade fermante en fin de ligne ou en fin)
+  const afterMarker = text.slice(idx + LINK_MARKER.length);
+
+  // Strategie simple : on cherche la fin du JSON en comptant les accolades
+  let depth = 0;
+  let endPos = -1;
+  let started = false;
+  for (let i = 0; i < afterMarker.length; i++) {
+    const ch = afterMarker[i];
+    if (ch === '{') {
+      depth++;
+      started = true;
+    } else if (ch === '}') {
+      depth--;
+      if (started && depth === 0) {
+        endPos = i + 1;
+        break;
+      }
+    }
+  }
+
+  if (endPos === -1) {
+    console.warn('[brain] Signal §LINK§ mal forme (pas de } final)');
+    return { text: text.slice(0, idx).trim(), bookingRequest: null };
+  }
+
+  const jsonStr = afterMarker.slice(0, endPos).trim();
+  const cleanText = (text.slice(0, idx) + afterMarker.slice(endPos)).trim();
+
+  try {
+    const bookingRequest = JSON.parse(jsonStr);
+    return { text: cleanText, bookingRequest };
+  } catch (err) {
+    console.warn('[brain] JSON §LINK§ illisible :', jsonStr);
+    return { text: cleanText, bookingRequest: null };
+  }
+}
+
+// Genere le bloc texte a ajouter a la reponse quand un lien est demande.
+function formatBookingLink(bookingRequest) {
+  console.log('[booking] Demande de lien :', JSON.stringify(bookingRequest));
+
+  const result = buildBookingURL({
+    from: bookingRequest.from,
+    to: bookingRequest.to,
+    date: bookingRequest.date,
+    adults: bookingRequest.adults,
+    children: bookingRequest.children || 0,
+    infants: bookingRequest.infants || 0,
+  });
+
+  if (!result.success) {
+    console.log('[booking] Echec :', result.error);
+    return `\n\n⚠️ Impossible de generer le lien : ${result.error}\n\nPour finaliser votre reservation, contactez le service client au +235 64 00 00 61 ou rendez-vous sur flyroyalairways.com`;
+  }
+
+  console.log('[booking] Lien genere :', result.url);
+
+  // Format passagers lisible
+  const passagers = [];
+  if (result.summary.adults > 0) passagers.push(`${result.summary.adults} adulte${result.summary.adults > 1 ? 's' : ''}`);
+  if (result.summary.children > 0) passagers.push(`${result.summary.children} enfant${result.summary.children > 1 ? 's' : ''}`);
+  if (result.summary.infants > 0) passagers.push(`${result.summary.infants} bebe${result.summary.infants > 1 ? 's' : ''}`);
+
+  return `\n\n✈️ *Lien de reservation Royal Airways :*\n${result.url}\n\n📋 ${result.summary.from} → ${result.summary.to} · ${result.summary.date} · ${passagers.join(', ')}\n\nCliquez sur le lien pour choisir votre classe et payer en ligne sur le site officiel.`;
+}
+
 export async function generateReply(history, userMessage) {
   const messages = [...history, { role: 'user', content: userMessage }];
   const systemPrompt = await buildDatedSystemPrompt();
@@ -137,11 +217,19 @@ export async function generateReply(history, userMessage) {
     messages,
   });
 
-  const rawText = response.content
+  let rawText = response.content
     .filter((block) => block.type === 'text')
     .map((block) => block.text)
     .join('\n')
     .trim();
 
+  // 1. Extraire et traiter le signal §LINK§ (parcours reservation)
+  const { text: textAfterLink, bookingRequest } = parseBookingSignal(rawText);
+  rawText = textAfterLink;
+  if (bookingRequest) {
+    rawText = rawText + formatBookingLink(bookingRequest);
+  }
+
+  // 2. Extraire le signal §CTRL§ (comme avant)
   return parseControlSignal(rawText);
 }
