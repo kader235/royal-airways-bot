@@ -2,9 +2,10 @@
 // Charge le system prompt + base de connaissances, injecte date, annonces,
 // lignes, tarifs et bagages en temps reel, puis appelle l'API Claude.
 //
-// V2 : ajout du parcours de reservation guidee. Claude peut emettre un signal
-// §LINK§{...} a la fin de sa reponse, qui declenche la generation d'un deep link
-// vers booking.flyroyalairways.com avec les criteres pre-remplis.
+// V2.1 : parcours de reservation guidee + ordre de parsing corrige.
+//        Claude peut emettre §LINK§{...} suivi de §CTRL§{...} en fin de reponse.
+//        On parse §CTRL§ EN PREMIER (toujours en dernier dans le texte),
+//        puis §LINK§ sur le reste.
 
 import {
   getActiveAnnouncementsForPrompt,
@@ -70,7 +71,6 @@ function buildDateBlock() {
 async function buildDatedSystemPrompt() {
   const dateBlock = buildDateBlock();
 
-  // Recuperation parallele des 4 blocs (cache de 1 min dans le fetcher)
   const [annoncesBlock, routesBlock, faresBlock, knowledgeBlock] = await Promise.all([
     getActiveAnnouncementsForPrompt().catch((e) => {
       console.error('[brain] Annonces :', e.message);
@@ -92,7 +92,6 @@ async function buildDatedSystemPrompt() {
 
   let prompt = SYSTEM_TEMPLATE;
 
-  // Helper pour injecter un bloc avec fallback (ajout en tete si marqueur absent)
   function inject(marker, block) {
     if (prompt.includes(marker)) {
       prompt = prompt.replace(marker, block);
@@ -116,64 +115,96 @@ const MODEL = process.env.CLAUDE_MODEL || 'claude-opus-4-7';
 const CTRL_MARKER = '§CTRL§';
 const LINK_MARKER = '§LINK§';
 
-// Parse le signal de controle §CTRL§{json} a la fin de la reponse.
+// Extrait un JSON balance (avec accolades equilibrees) commence quelque part
+// apres la position 'start' dans 'text'. Cherche la premiere '{' apres start,
+// puis matche les accolades en tenant compte des chaines et de l'echappement.
+// Retourne { json, endPos } ou null si pas trouve.
+function extractBalancedJSON(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+  let startedAt = -1;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+    if (ch === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === '{') {
+      if (startedAt === -1) startedAt = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && startedAt !== -1) {
+        return { json: text.slice(startedAt, i + 1), endPos: i + 1 };
+      }
+    }
+  }
+  return null;
+}
+
+// Parse le signal §CTRL§{...} en FIN de texte.
+// C'est TOUJOURS le dernier signal (le bot est instruit de le mettre a la fin).
 function parseControlSignal(rawText) {
   const idx = rawText.lastIndexOf(CTRL_MARKER);
   const fallback = { escalade: false, motif: null, langue: 'fr', intention: 'autre' };
   if (idx === -1) return { reply: rawText.trim(), control: fallback, controlOk: false };
 
   const reply = rawText.slice(0, idx).trim();
-  const jsonPart = rawText.slice(idx + CTRL_MARKER.length).trim();
+  const extracted = extractBalancedJSON(rawText, idx + CTRL_MARKER.length);
+
+  if (!extracted) {
+    console.warn('[brain] Signal de controle sans JSON balance trouve.');
+    return { reply, control: fallback, controlOk: false };
+  }
+
   try {
-    const control = JSON.parse(jsonPart);
+    const control = JSON.parse(extracted.json);
     return { reply, control: { ...fallback, ...control }, controlOk: true };
   } catch (err) {
-    console.warn('[brain] Signal de controle illisible :', jsonPart);
+    console.warn('[brain] Signal de controle illisible :', extracted.json);
     return { reply, control: fallback, controlOk: false };
   }
 }
 
-// Parse le signal de reservation §LINK§{json} dans la reponse.
-// Retire le marqueur du texte, et si valide, retourne les criteres de booking.
+// Parse le signal §LINK§{...} dans un texte.
+// Retire le marqueur ET le JSON du texte, et retourne les criteres parses.
 function parseBookingSignal(text) {
   const idx = text.indexOf(LINK_MARKER);
   if (idx === -1) return { text, bookingRequest: null };
 
-  // Cherche la fin du JSON (premiere accolade fermante en fin de ligne ou en fin)
-  const afterMarker = text.slice(idx + LINK_MARKER.length);
+  const extracted = extractBalancedJSON(text, idx + LINK_MARKER.length);
 
-  // Strategie simple : on cherche la fin du JSON en comptant les accolades
-  let depth = 0;
-  let endPos = -1;
-  let started = false;
-  for (let i = 0; i < afterMarker.length; i++) {
-    const ch = afterMarker[i];
-    if (ch === '{') {
-      depth++;
-      started = true;
-    } else if (ch === '}') {
-      depth--;
-      if (started && depth === 0) {
-        endPos = i + 1;
-        break;
-      }
-    }
+  if (!extracted) {
+    console.warn('[brain] Signal §LINK§ mal forme (pas de JSON balance).');
+    return {
+      text: (text.slice(0, idx) + text.slice(idx + LINK_MARKER.length)).trim(),
+      bookingRequest: null,
+    };
   }
 
-  if (endPos === -1) {
-    console.warn('[brain] Signal §LINK§ mal forme (pas de } final)');
-    return { text: text.slice(0, idx).trim(), bookingRequest: null };
-  }
-
-  const jsonStr = afterMarker.slice(0, endPos).trim();
-  const cleanText = (text.slice(0, idx) + afterMarker.slice(endPos)).trim();
+  const beforeMarker = text.slice(0, idx);
+  const afterJSON = text.slice(extracted.endPos);
+  const finalText = (beforeMarker + afterJSON).trim();
 
   try {
-    const bookingRequest = JSON.parse(jsonStr);
-    return { text: cleanText, bookingRequest };
+    const bookingRequest = JSON.parse(extracted.json);
+    return { text: finalText, bookingRequest };
   } catch (err) {
-    console.warn('[brain] JSON §LINK§ illisible :', jsonStr);
-    return { text: cleanText, bookingRequest: null };
+    console.warn('[brain] JSON §LINK§ illisible :', extracted.json);
+    return { text: finalText, bookingRequest: null };
   }
 }
 
@@ -197,7 +228,6 @@ function formatBookingLink(bookingRequest) {
 
   console.log('[booking] Lien genere :', result.url);
 
-  // Format passagers lisible
   const passagers = [];
   if (result.summary.adults > 0) passagers.push(`${result.summary.adults} adulte${result.summary.adults > 1 ? 's' : ''}`);
   if (result.summary.children > 0) passagers.push(`${result.summary.children} enfant${result.summary.children > 1 ? 's' : ''}`);
@@ -223,13 +253,27 @@ export async function generateReply(history, userMessage) {
     .join('\n')
     .trim();
 
-  // 1. Extraire et traiter le signal §LINK§ (parcours reservation)
-  const { text: textAfterLink, bookingRequest } = parseBookingSignal(rawText);
-  rawText = textAfterLink;
+  // === ORDRE DE PARSING CRITIQUE ===
+  //
+  // Claude emet en fin de reponse :
+  //   ...texte...  §LINK§{...}  §CTRL§{...}
+  //
+  // On parse §CTRL§ EN PREMIER (lastIndexOf trouve le dernier marqueur)
+  // pour le retirer du texte. Puis sur le texte restant, on parse §LINK§.
+
+  // 1. Extraire et retirer §CTRL§ (s'il existe)
+  const { reply: textWithoutCtrl, control, controlOk } = parseControlSignal(rawText);
+
+  // 2. Sur le texte restant (sans §CTRL§), extraire et traiter §LINK§
+  const { text: textWithoutLink, bookingRequest } = parseBookingSignal(textWithoutCtrl);
+  let finalText = textWithoutLink;
   if (bookingRequest) {
-    rawText = rawText + formatBookingLink(bookingRequest);
+    finalText = finalText + formatBookingLink(bookingRequest);
   }
 
-  // 2. Extraire le signal §CTRL§ (comme avant)
-  return parseControlSignal(rawText);
+  return {
+    reply: finalText.trim(),
+    control,
+    controlOk,
+  };
 }
