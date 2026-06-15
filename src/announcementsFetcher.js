@@ -7,6 +7,9 @@
 // Variables d'env attendues :
 //   ADMIN_API_URL  - ex: https://royal-airways-admin-api.onrender.com
 //   BOT_SYNC_KEY   - la meme cle secrete que cote admin
+//
+// PATCH 15/06/2026 : timeout 90s (au lieu de 3s) + retry 2x pour gerer
+// le reveil de Render Free Tier (50-60s de spin-up).
 
 const ADMIN_API_URL = process.env.ADMIN_API_URL;
 const BOT_SYNC_KEY = process.env.BOT_SYNC_KEY;
@@ -21,7 +24,7 @@ const cache = {
 };
 
 // ============================================================
-// Fonction de fetch generique avec cache
+// Fonction de fetch generique avec cache + retry + timeout long
 // ============================================================
 
 async function fetchEndpoint(name, path) {
@@ -35,22 +38,39 @@ async function fetchEndpoint(name, path) {
     return null;
   }
 
-  try {
-    const res = await fetch(`${ADMIN_API_URL}${path}`, {
-      headers: { 'X-Bot-Key': BOT_SYNC_KEY },
-      signal: AbortSignal.timeout(3000),
-    });
-    if (!res.ok) {
-      console.error(`[fetcher/${name}] HTTP ${res.status}`);
+  // PATCH : retry 2x avec timeout long pour gerer le reveil Render
+  const TIMEOUT_MS = 90_000; // 90s pour laisser le temps au backend de se reveiller
+  const MAX_ATTEMPTS = 2;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(`${ADMIN_API_URL}${path}`, {
+        headers: { 'X-Bot-Key': BOT_SYNC_KEY },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        console.error(`[fetcher/${name}] HTTP ${res.status} (essai ${attempt}/${MAX_ATTEMPTS})`);
+        if (attempt < MAX_ATTEMPTS) continue;
+        return cache[name].data;
+      }
+      const data = await res.json();
+      cache[name] = { data, fetchedAt: now };
+      if (attempt > 1) {
+        console.log(`[fetcher/${name}] OK apres ${attempt} essais`);
+      }
+      return data;
+    } catch (err) {
+      console.error(`[fetcher/${name}] Erreur fetch (essai ${attempt}/${MAX_ATTEMPTS}) :`, err.message);
+      if (attempt < MAX_ATTEMPTS) {
+        // Petit delai avant retry
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
+      }
       return cache[name].data;
     }
-    const data = await res.json();
-    cache[name] = { data, fetchedAt: now };
-    return data;
-  } catch (err) {
-    console.error(`[fetcher/${name}] Erreur fetch :`, err.message);
-    return cache[name].data;
   }
+
+  return cache[name].data;
 }
 
 // ============================================================
