@@ -1,8 +1,8 @@
 // =============================================================
-// announcementsFetcher.js — Version robuste
+// announcementsFetcher.js — Version robuste compatible
 // =============================================================
-// Récupère les annonces actives depuis le backend admin Royal Airways
-// Patch : timeout 90s + retry 3x + fallback gracieux
+// Garde getActiveAnnouncementsForPrompt utilisé par brain.js
+// Ajoute timeout 90s + retry + cache
 // =============================================================
 
 import { fetchWithRetry } from './fetchWithRetry.js';
@@ -10,18 +10,16 @@ import { fetchWithRetry } from './fetchWithRetry.js';
 const ADMIN_API_URL = process.env.ADMIN_API_URL || 'https://royal-airways-admin-api.onrender.com';
 const ENDPOINT = `${ADMIN_API_URL}/api/announcements/active`;
 
-let cachedAnnouncements = []; // Cache mémoire pour fallback
+let cachedAnnouncements = [];
 let lastFetchTime = 0;
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 /**
  * Récupère les annonces actives, avec cache et fallback
- * @returns {Promise<Array>} Tableau des annonces (vide si tout échoue)
  */
 export async function fetchAnnouncements() {
   const now = Date.now();
 
-  // Utiliser le cache si récent
   if (cachedAnnouncements.length > 0 && (now - lastFetchTime) < CACHE_TTL) {
     return cachedAnnouncements;
   }
@@ -39,19 +37,49 @@ export async function fetchAnnouncements() {
     }
   );
 
-  if (data && Array.isArray(data.announcements)) {
-    cachedAnnouncements = data.announcements;
-    lastFetchTime = now;
-    console.log(`[fetcher/announcements] ${data.announcements.length} annonces chargées`);
-    return data.announcements;
+  // Selon la structure de réponse : data.announcements OU data directement
+  let announcements = null;
+  if (data) {
+    if (Array.isArray(data.announcements)) announcements = data.announcements;
+    else if (Array.isArray(data)) announcements = data;
   }
 
-  // Fallback : retourner le dernier cache connu, même expiré
+  if (announcements) {
+    cachedAnnouncements = announcements;
+    lastFetchTime = now;
+    console.log(`[fetcher/announcements] ${announcements.length} annonces chargées`);
+    return announcements;
+  }
+
   if (cachedAnnouncements.length > 0) {
-    console.warn(`[fetcher/announcements] ⚠ Utilisation du cache expiré (${cachedAnnouncements.length} annonces)`);
+    console.warn(`[fetcher/announcements] ⚠ Utilisation du cache expiré`);
     return cachedAnnouncements;
   }
 
-  console.warn(`[fetcher/announcements] ⚠ Aucune annonce disponible (backend HS)`);
+  console.warn(`[fetcher/announcements] ⚠ Aucune annonce disponible`);
   return [];
+}
+
+/**
+ * COMPATIBILITÉ : retourne les annonces formatées pour injection dans le prompt
+ * (fonction utilisée par brain.js)
+ */
+export async function getActiveAnnouncementsForPrompt() {
+  const announcements = await fetchAnnouncements();
+
+  if (!announcements || announcements.length === 0) {
+    return '';
+  }
+
+  // Formatage pour injection dans le system prompt
+  const formatted = announcements
+    .map((a, i) => {
+      // Adaptation selon la structure : titre/title, message/content, etc.
+      const title = a.titre || a.title || a.nom || `Annonce ${i + 1}`;
+      const content = a.message || a.content || a.contenu || a.texte || '';
+      return `- ${title} : ${content}`;
+    })
+    .join('\n');
+
+  return `\n\n## ANNONCES ACTIVES\n${formatted}\n`;
 }
